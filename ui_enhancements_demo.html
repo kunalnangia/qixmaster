@@ -1,0 +1,223 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Enhanced Workflow UI Enhancements Demo</title>
+    <style>
+        body {
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+            max-width: 800px;
+            margin: 0 auto;
+            padding: 20px;
+            background-color: #f5f7fa;
+            color: #333;
+        }
+        .header {
+            background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+            color: white;
+            padding: 20px;
+            border-radius: 10px;
+            margin-bottom: 20px;
+            box-shadow: 0 4px 6px rgba(0,0,0,0.1);
+        }
+        .enhanced-badge {
+            display: inline-flex;
+            align-items: center;
+            padding: 4px 12px;
+            border-radius: 9999px;
+            font-size: 0.75rem;
+            font-weight: 500;
+            background-color: #dbeafe;
+            color: #1e40af;
+            margin-top: 10px;
+        }
+        .dot {
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background-color: #3b82f6;
+            margin-right: 6px;
+        }
+        .card {
+            background: white;
+            border-radius: 8px;
+            padding: 20px;
+            margin-bottom: 20px;
+            box-shadow: 0 2px 4px rgba(0,0,0,0.05);
+            border: 1px solid #e2e8f0;
+        }
+        .card-title {
+            font-size: 1.25rem;
+            font-weight: 600;
+            margin-bottom: 15px;
+            color: #2d3748;
+        }
+        .info-box {
+            padding: 16px;
+            border-radius: 8px;
+            margin-bottom: 16px;
+        }
+        .blue-info {
+            background-color: #eff6ff;
+            border: 1px solid #dbeafe;
+            color: #1e40af;
+        }
+        .purple-info {
+            background-color: #f5f3ff;
+            border: 1px solid #ede9fe;
+            color: #5b21b6;
+        }
+        .grid {
+            display: grid;
+            grid-template-columns: repeat(2, 1fr);
+            gap: 16px;
+            margin-bottom: 16px;
+        }
+        .grid-item {
+            background-color: #f8fafc;
+            padding: 12px;
+            border-radius: 6px;
+            border: 1px solid #e2e8f0;
+        }
+        .grid-item .label {
+            font-weight: 500;
+            font-size: 0.875rem;
+            color: #64748b;
+        }
+        .grid-item .value {
+            font-size: 0.875rem;
+            color: #334155;
+            margin-top: 4px;
+        }
+        .list {
+            padding-left: 20px;
+        }
+        .list li {
+            margin-bottom: 8px;
+            color: #4b5563;
+        }
+        .success-text {
+            color: #059669;
+        }
+        .warning-text {
+            color: #d97706;
+        }
+        h2 {
+            color: #2d3748;
+            border-bottom: 2px solid #e2e8f0;
+            padding-bottom: 8px;
+        }
+    </style>
+</head>
+<body>
+    <div class="header">
+        <h1>Performance Testing Dashboard</h1>
+        <div class="enhanced-badge">
+            <div class="dot"></div>
+            Enhanced AI Workflow Active
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-title">Test Results</div>
+        <div class="info-box blue-info">
+            <div style="display: flex; align-items: center;">
+                <div style="width: 8px; height: 8px; border-radius: 50%; background-color: #3b82f6; margin-right: 8px;"></div>
+                <strong>Enhanced AI Workflow</strong>
+                <span style="margin-left: 8px; font-size: 0.875rem;">(Powered by LangGraph)</span>
+            </div>
+            <div style="font-size: 0.875rem; margin-top: 4px;">Status: SUCCESS</div>
+        </div>
+
+        <div class="grid">
+            <div class="grid-item">
+                <div class="label">Avg Response Time</div>
+                <div class="value">150ms</div>
+            </div>
+            <div class="grid-item">
+                <div class="label">95th Percentile</div>
+                <div class="value">250ms</div>
+            </div>
+            <div class="grid-item">
+                <div class="label">Error Rate</div>
+                <div class="value">0.5%</div>
+            </div>
+            <div class="grid-item">
+                <div class="label">Throughput</div>
+                <div class="value">50 req/min</div>
+            </div>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-title">AI Performance Analysis</div>
+        <div class="info-box purple-info">
+            <div style="display: flex; align-items: center;">
+                <div style="width: 8px; height: 8px; border-radius: 50%; background-color: #8b5cf6; margin-right: 8px;"></div>
+                <strong>Enhanced AI Insights Available</strong>
+            </div>
+            <div style="font-size: 0.875rem; margin-top: 4px;">
+                Generated by LangGraph-powered workflow with advanced analysis capabilities
+            </div>
+        </div>
+
+        <div style="margin-bottom: 20px;">
+            <h3>AI Performance Score</h3>
+            <div style="font-size: 2rem; font-weight: bold; color: #7e22ce;">85/100</div>
+        </div>
+
+        <div style="margin-bottom: 20px;">
+            <h3>Executive Summary</h3>
+            <div style="padding: 12px; background-color: #f8fafc; border-radius: 6px; border: 1px solid #e2e8f0;">
+                <p style="margin: 0; color: #334155;">
+                    The performance test completed successfully with excellent response times and low error rates. 
+                    The system demonstrates strong scalability under the current load configuration.
+                </p>
+            </div>
+        </div>
+
+        <div style="margin-bottom: 20px;">
+            <h3>Bottlenecks</h3>
+            <ul class="list">
+                <li>No critical bottlenecks identified</li>
+                <li class="warning-text">Minor database query optimization opportunity detected</li>
+            </ul>
+        </div>
+
+        <div style="margin-bottom: 20px;">
+            <h3>Recommendations</h3>
+            <ul class="list">
+                <li class="success-text">Implement database query caching for improved performance</li>
+                <li class="success-text">Add CDN for static asset delivery</li>
+                <li class="success-text">Enable GZIP compression on API responses</li>
+            </ul>
+        </div>
+    </div>
+
+    <div class="card">
+        <div class="card-title">Debug Information</div>
+        <div class="info-box blue-info">
+            <h3 style="margin-top: 0;">Enhanced AI Workflow (LangGraph)</h3>
+            <div class="grid">
+                <div class="grid-item">
+                    <div class="label">Workflow Status</div>
+                    <div class="value success-text">SUCCESS</div>
+                </div>
+                <div class="grid-item">
+                    <div class="label">AI Insights</div>
+                    <div class="value success-text">Available</div>
+                </div>
+            </div>
+            <div style="margin-top: 12px;">
+                <div class="label">Next Recommended Actions:</div>
+                <ul class="list" style="margin-top: 4px;">
+                    <li>Review results</li>
+                    <li>Implement recommendations</li>
+                    <li>Run follow-up performance tests</li>
+                </ul>
+            </div>
+        </div>
+    </div>
+</body>
+</html>

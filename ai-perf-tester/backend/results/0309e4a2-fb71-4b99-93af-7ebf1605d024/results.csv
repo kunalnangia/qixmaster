@@ -1,0 +1,10 @@
+timeStamp,elapsed,label,responseCode,responseMessage,threadName,dataType,success,failureMessage,bytes,sentBytes,grpThreads,allThreads,URL,Latency,IdleTime,Connect
+1757157115609,755,HTTP Request,200,OK,Thread Group 1-1,text,true,,17596,110,1,1,https://sabha.io/,750,0,720
+1757157116368,22,HTTP Request,200,OK,Thread Group 1-1,text,true,,17596,110,1,1,https://sabha.io/,20,0,0
+1757157116390,21,HTTP Request,200,OK,Thread Group 1-1,text,true,,17596,110,1,1,https://sabha.io/,15,0,0
+1757157116411,18,HTTP Request,200,OK,Thread Group 1-1,text,true,,17596,110,1,1,https://sabha.io/,17,0,0
+1757157116430,18,HTTP Request,200,OK,Thread Group 1-1,text,true,,17596,110,1,1,https://sabha.io/,16,0,0
+1757157116448,18,HTTP Request,200,OK,Thread Group 1-1,text,true,,17596,110,1,1,https://sabha.io/,16,0,0
+1757157116466,17,HTTP Request,200,OK,Thread Group 1-1,text,true,,17596,110,1,1,https://sabha.io/,16,0,0
+1757157116483,17,HTTP Request,200,OK,Thread Group 1-1,text,true,,17596,110,1,1,https://sabha.io/,16,0,0
+1757157116501,16,HTTP Request,200,OK,Thread Group 1-1,text,true,,17596,110,1,1,https://sabha.io/,15,0,0

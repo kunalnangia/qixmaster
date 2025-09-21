@@ -1,0 +1,2266 @@
+import os
+import sys
+import logging
+import json
+import traceback
+import uuid  # For generating unique request IDs
+import asyncio
+import uvicorn
+import subprocess  # Move subprocess import to module level to fix unbound variable error
+from datetime import datetime, timedelta
+from typing import List, Dict, Any, Optional, Set, Union
+from contextlib import asynccontextmanager
+from pathlib import Path
+from sqlalchemy import text, create_engine
+from sqlalchemy.engine import Engine
+from sqlalchemy.orm import Session
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, WebSocket, WebSocketDisconnect, Request, status, BackgroundTasks, Response
+from fastapi.middleware.cors import CORSMiddleware
+from sqlalchemy.ext.asyncio import AsyncSession
+from fastapi import Depends
+from app.db.session import get_db, get_db_sync
+from app.models.db_models import (
+    Project as DBProject, 
+    User, 
+    Team, 
+    TestCase, 
+    TestStep, 
+    TestPlan, 
+    TestExecution,
+    Comment as DBComment,
+    TestStep,
+    TestPlanTestCase,
+    TeamMember,
+    Environment,
+    Attachment,
+    ActivityLog,
+    TestType,
+    Priority
+)
+    
+# Configure queue-based logging
+from app.core.logging_config import setup_queue_logging, get_queue_logger
+
+# Set up logging with queue-based system
+logger = setup_queue_logging(
+    log_level=os.getenv("LOG_LEVEL", "INFO"),
+    log_dir="logs"
+)
+
+# Log startup message
+logger.info("=" * 80)
+logger.info(f"Application starting with queue-based logging (level: {os.getenv('LOG_LEVEL', 'INFO')})")
+logger.info(f"Python version: {sys.version}")
+logger.info(f"Working directory: {os.getcwd()}")
+logger.info("=" * 80)
+
+# Get logger for this module
+logger = get_queue_logger(__name__)
+
+# Enable SQLAlchemy logging
+logging.getLogger('sqlalchemy.engine').setLevel(logging.DEBUG)
+logging.getLogger('sqlalchemy.pool').setLevel(logging.DEBUG)
+logging.getLogger('sqlalchemy.orm').setLevel(logging.INFO)
+
+
+# Add the parent directory to the Python path
+sys.path.append(str(Path(__file__).parent.parent))
+
+# Import models first to ensure they are registered with SQLAlchemy
+from app.models.db_models import (
+    Project as DBProject, 
+    User, 
+    Team, 
+    TestCase, 
+    TestExecution, 
+    Comment as DBComment,
+    TestStep,
+    TestPlan,
+    TestPlanTestCase,
+    TeamMember,
+    Environment,
+    Attachment,
+    ActivityLog
+)
+
+import asyncio
+from sqlalchemy.exc import OperationalError
+
+async def initialize_database():
+    max_retries = 3
+    for attempt in range(max_retries):
+        try:
+            logger.info(f"Attempting to connect to database (Attempt {attempt + 1}/{max_retries})")
+            logger.debug(f"Using connection string: {os.getenv('DATABASE_URL')}")
+            
+            with sync_engine.connect() as conn:
+                # Test the connection with a simple query
+                result = conn.execute(text("SELECT version();"))
+                version = result.scalar()
+                logger.info(f"Successfully connected to PostgreSQL version: {version}")
+                
+                # Check if tables exist
+                table_check = conn.execute(text("""
+                    SELECT table_name 
+                    FROM information_schema.tables 
+                    WHERE table_schema = 'public';
+                """))
+                tables = [row[0] for row in table_check]
+                logger.info(f"Found {len(tables)} tables in the database")
+                if tables:
+                    logger.debug(f"Tables: {', '.join(tables)}")
+                
+                logger.info("Database connection test successful")
+                return True
+                
+        except Exception as e:
+            logger.error(f"Database connection error (Attempt {attempt + 1}/{max_retries}): {str(e)}")
+            logger.debug(f"Error details: {traceback.format_exc()}")
+            
+            if attempt < max_retries - 1:
+                wait_time = 5 * (attempt + 1)  # Exponential backoff
+                logger.warning(f"Retrying in {wait_time} seconds...")
+                await asyncio.sleep(wait_time)
+            else:
+                logger.critical("Max retries reached. Could not connect to database.")
+                # Don't raise the exception, just continue with degraded mode
+                logger.warning("[OFFLINE MODE] Starting application without full database initialization")
+                logger.warning("[OFFLINE MODE] Some features may not work properly until database is available")
+                return False
+
+# Import API routers
+from app.api.v1.routes import (
+    test_cases,
+    teams,
+    environments,
+    attachments,
+    projects,
+    comments,
+    auth,
+    executions,
+    ai,
+    newman,
+    test_plans  # Added test_plans router
+)
+
+# Import schemas
+from app.schemas.user import UserCreate, UserLogin
+from app.schemas.project import ProjectCreate, Project as ProjectResponse, ProjectUpdate  
+from app.schemas.test_case import TestCaseResponse, TestCaseCreate, TestCaseUpdate
+from app.schemas.comment import CommentCreate, Comment as CommentResponse, CommentInDB
+from app.schemas.ai import AITestGenerationRequest, AIURLTestGenerationRequest, AIDebugRequest, AIPrioritizationRequest, AIAnalysisResult, AIAnalysisStatus
+from app.schemas.execution import TestExecutionCreate, TestExecutionResponse, ExecutionStatus
+from app.schemas.dashboard import DashboardStats, ActivityFeed, ActivityType, TargetType
+
+# FastAPI imports
+from fastapi import FastAPI, APIRouter, HTTPException, Depends, WebSocket, WebSocketDisconnect, Request, status, BackgroundTasks, Query
+from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
+from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
+from fastapi.encoders import jsonable_encoder
+
+# SQLAlchemy imports
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import SQLAlchemyError
+from sqlalchemy.future import select
+
+# JWT imports
+from jose import jwt, JWTError
+
+# Application imports
+from app.db.session import SessionLocal, engine as sync_engine, get_db
+from app.core.security import create_access_token, get_password_hash, verify_password, oauth2_scheme
+from app.auth.security import AuthService
+from app.websocket.manager import WebSocketManager, websocket_manager
+from app.api.v1.routes import test_cases, teams, environments, attachments
+
+# Pydantic imports
+from pydantic import BaseModel, Field, validator, EmailStr
+
+# Environment variables
+from dotenv import load_dotenv
+import os
+
+# Load environment variables from the .env file in the project root directory
+env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), '.env')
+load_dotenv(env_path)
+
+# Print the database URL for debugging (remove in production)
+print(f"Database URL: {os.getenv('DATABASE_URL')}")
+
+# Initialize the WebSocket manager
+websocket_manager = WebSocketManager()
+from app.ai_service import AIService
+# Import schemas and models
+from app.models import *
+
+# Service imports
+from app.websocket.manager import WebSocketManager, websocket_manager
+from app.ai_service import AIService
+
+
+
+# Configure logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
+# Load environment variables
+load_dotenv()
+
+# Initialize services
+ai_service = AIService()
+
+# WebSocket manager is already initialized in websocket_manager.py
+# and imported as websocket_manager
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    try:
+        logger.info("Starting database initialization...")
+        
+        # First, reset database connections to ensure PgBouncer compatibility
+        logger.info("[RESET] Resetting database connections for PgBouncer compatibility...")
+        from app.db.session import reset_database_connections
+        reset_success = await reset_database_connections()
+        if reset_success:
+            logger.info("[SUCCESS] Database connections reset with PgBouncer compatibility")
+        else:
+            logger.warning("[WARNING] Database connection reset failed, continuing with existing settings")
+        
+        # Initialize database
+        db_initialized = await initialize_database()
+        if not db_initialized:
+            logger.warning("[WARNING] Database initialization failed, continuing in degraded mode")
+        
+        # Initialize Docker Newman
+        logger.info("Initializing Docker Newman...")
+        try:
+            # Pull the Newman Docker image to ensure it's available
+            result = subprocess.run(
+                ["docker", "pull", "postman/newman"],
+                capture_output=True,
+                text=True,
+                timeout=120  # 2 minute timeout
+            )
+            if result.returncode == 0:
+                logger.info("[SUCCESS] Docker Newman image is ready")
+            else:
+                logger.warning(f"[WARNING] Failed to pull Newman image: {result.stderr}")
+        except subprocess.TimeoutExpired:
+            logger.warning("[WARNING] Docker Newman pull timed out, continuing...")
+        except FileNotFoundError:
+            logger.warning("[WARNING] Docker not found, Newman tests will not work")
+        except Exception as e:
+            logger.warning(f"[WARNING] Failed to initialize Docker Newman: {str(e)}")
+        
+        # Test Docker Newman availability
+        try:
+            result = subprocess.run(
+                ["docker", "run", "--rm", "-t", "postman/newman", "--version"],
+                capture_output=True,
+                text=True,
+                timeout=30
+            )
+            if result.returncode == 0:
+                logger.info(f"[SUCCESS] Docker Newman is available (version: {result.stdout.strip()})")
+            else:
+                logger.warning(f"[WARNING] Docker Newman test failed: {result.stderr}")
+        except subprocess.TimeoutExpired:
+            logger.warning("[WARNING] Docker Newman test timed out, continuing...")
+        except FileNotFoundError:
+            logger.warning("[WARNING] Docker not found, Newman tests will not work")
+        except Exception as e:
+            logger.warning(f"[WARNING] Failed to test Docker Newman: {str(e)}")
+        
+        # Import all models to ensure they are registered with SQLAlchemy
+        from app.models.db_models import (
+            User, Project, TestCase, TestStep, TestPlan, TestExecution,
+            Comment, Team, TeamMember, Environment, Attachment, TestPlanTestCase, ActivityLog, TestType
+        )
+        
+        # Create tables in the correct order to avoid foreign key issues
+        tables = [
+            User.__table__,
+            Team.__table__,
+            Project.__table__,
+            Environment.__table__,  # Moved before TestCase since TestCase might reference it
+            TestCase.__table__,
+            TestStep.__table__,
+            TestPlan.__table__,
+            TestPlanTestCase.__table__,
+            TestExecution.__table__,  # Depends on TestCase, TestPlan, and Environment
+            Comment.__table__,
+            TeamMember.__table__,
+            Attachment.__table__,
+            ActivityLog.__table__
+        ]
+        
+        # Use the sync engine for table operations
+        from app.db.session import engine as sync_engine
+        
+        with sync_engine.connect() as conn:
+            # First, disable foreign key constraints
+            logger.info("Disabling foreign key constraints...")
+            conn.execute(text('SET session_replication_role = "replica";'))
+            
+            # Get all tables in the database
+            result = conn.execute(text(
+                """
+                SELECT tablename 
+                FROM pg_tables 
+                WHERE schemaname = 'public' 
+                ORDER BY tablename;
+                """
+            ))
+            all_tables = [row[0] for row in result]
+            
+            # Drop all tables in the correct order
+            logger.info("Dropping existing tables...")
+            for table_name in all_tables:
+                try:
+                    logger.info(f"Dropping table: {table_name}")
+                    conn.execute(text(f'DROP TABLE IF EXISTS \"{table_name}\" CASCADE;'))
+                    logger.info(f"Dropped table: {table_name}")
+                except Exception as e:
+                    logger.error(f"Error dropping table {table_name}: {str(e)}")
+                    raise
+            
+            # Create tables in order
+            logger.info("Creating database tables in order...")
+            for table in tables:
+                try:
+                    logger.info(f"Creating table: {table.name}")
+                    table.create(conn, checkfirst=True)
+                    logger.info(f"Table created: {table.name}")
+                except Exception as e:
+                    logger.error(f"Error creating table {table.name}: {str(e)}")
+                    raise
+        
+        logger.info("All database tables created successfully")
+        
+        # Ensure test user exists for development/testing
+        logger.info("Ensuring test user exists...")
+        try:
+            from app.db.session import ensure_test_user_exists
+            test_user_id = await ensure_test_user_exists()
+            logger.info(f"[SUCCESS] Test user ready: {test_user_id}")
+        except Exception as e:
+            logger.warning(f"[WARNING] Failed to ensure test user exists: {str(e)}")
+            logger.warning("Application will continue, but some functionality may fail")
+        
+        # Ensure AI Generator system user exists for AI-generated content
+        logger.info("Ensuring AI Generator system user exists...")
+        try:
+            from app.db.session import ensure_ai_generator_user_exists
+            ai_user_id = await ensure_ai_generator_user_exists()
+            logger.info(f"[SUCCESS] AI Generator user ready: {ai_user_id}")
+        except Exception as e:
+            logger.warning(f"[WARNING] Failed to ensure AI Generator user exists: {str(e)}")
+            logger.warning("AI test case generation may fail without this user")
+        
+    except Exception as e:
+        logger.error(f"Error initializing database: {str(e)}")
+        logger.error(traceback.format_exc())
+        logger.warning("[OFFLINE MODE] Starting application without full database initialization")
+        logger.warning("[OFFLINE MODE] Some features may not work properly until database is available")
+        # Don't exit, allow app to start in degraded mode
+    
+    yield
+    logger.info("Application shutdown")
+
+# Configure CORS with specific allowed origins
+origins = [
+    "http://localhost:5173",
+    "http://localhost:5174", 
+    "http://localhost:5175",  # Vite dev server
+    "http://localhost:5176",  # Vite dev server (new port)
+    "http://127.0.0.1:5173",
+    "http://127.0.0.1:5174",
+    "http://127.0.0.1:5175",
+    "http://127.0.0.1:5176",  # Vite dev server (new port)
+    "http://localhost:3000",
+    "http://127.0.0.1:3000",
+    "http://localhost:8000",
+    "http://127.0.0.1:8000",
+    "http://localhost:8001",
+    "http://127.0.0.1:8001",
+    "http://192.168.1.2:5175",  # Network IP for frontend access
+    "http://192.168.1.2:5173",  # Additional port for frontend
+    "http://localhost:5175",  # Ensure localhost with port 5175 is included
+    "http://localhost:5176"   # Ensure localhost with port 5176 is included
+]
+
+# Access token expiration time in minutes
+ACCESS_TOKEN_EXPIRE_MINUTES = 30
+
+# Simple async get_current_user function
+async def get_current_user(
+    token: str = Depends(oauth2_scheme),
+    db: AsyncSession = Depends(get_db)
+) -> dict:
+    """
+    Get the current authenticated user from the JWT token.
+    
+    Args:
+        token: JWT token from the Authorization header
+        db: Async database session
+        
+    Returns:
+        dict: The authenticated user's information
+        
+    Raises:
+        HTTPException: If the token is invalid or the user doesn't exist
+    """
+    from app.core.config import settings
+    
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
+    try:
+        # Decode the JWT token
+        payload = jwt.decode(
+            token,
+            settings.SECRET_KEY,
+            algorithms=["HS256"]  # Use hardcoded algorithm for now
+        )
+        user_id = payload.get("sub")
+        if user_id is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+        
+    # Get user from database
+    query = select(User).where(User.id == user_id)
+    result = await db.execute(query)
+    user = result.scalars().first()
+    
+    if user is None:
+        raise credentials_exception
+        
+    return {
+        "id": str(user.id),
+        "email": user.email,
+        "full_name": user.full_name,
+        "role": getattr(user, 'role', 'tester'),
+        "is_active": getattr(user, 'is_active', True)
+    }
+
+# Synchronous version of get_current_user for sync routes
+def get_current_user_sync(
+    token: str = Depends(oauth2_scheme),
+    db: Session = Depends(get_db_sync)
+) -> dict:
+    """
+    Get the current authenticated user from the JWT token (synchronous version).
+    
+    Args:
+        token: JWT token from the Authorization header
+        db: Synchronous database session
+        
+    Returns:
+        dict: The authenticated user's information
+        
+    Raises:
+        HTTPException: If the token is invalid or the user doesn't exist
+    """
+    from app.core.config import settings
+    
+    credentials_exception = HTTPException(
+        status_code=status.HTTP_401_UNAUTHORIZED,
+        detail="Could not validate credentials",
+        headers={"WWW-Authenticate": "Bearer"},
+    )
+    
+    try:
+        # Decode the JWT token
+        payload = jwt.decode(
+            token,
+            settings.SECRET_KEY,
+            algorithms=["HS256"]
+        )
+        user_id = payload.get("sub")
+        if user_id is None:
+            raise credentials_exception
+    except JWTError:
+        raise credentials_exception
+        
+    # Get user from database using synchronous query
+    user = db.query(User).filter(User.id == user_id).first()
+    
+    if user is None:
+        raise credentials_exception
+        
+    return {
+        "id": str(user.id),
+        "email": user.email,
+        "full_name": user.full_name,
+        "role": getattr(user, 'role', 'tester'),
+        "is_active": getattr(user, 'is_active', True)
+    }
+
+# Create the main app
+app = FastAPI(
+    title="IntelliTest AI Automation Platform",
+    description="Enterprise-grade AI-powered test automation platform",
+    version="1.0.0",
+    docs_url="/api/docs",
+    redoc_url="/api/redoc",
+    openapi_url="/api/openapi.json",
+    lifespan=lifespan
+)
+
+# Add CORS middleware with specific configuration
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=origins,  # Only allow specified origins
+    allow_credentials=True,
+    allow_methods=["*"],  # Allow all methods for now, can be restricted later
+    allow_headers=[
+        "*",  # Allow all headers for now to debug CORS issues
+    ],
+    expose_headers=["*"],
+    max_age=600  # Cache preflight requests for 10 minutes
+)
+
+# Add middleware to add CORS headers to every response
+@app.middleware("http")
+async def add_cors_headers(request: Request, call_next):
+    response = await call_next(request)
+    origin = request.headers.get('origin')
+    if origin in origins:
+        response.headers['Access-Control-Allow-Origin'] = origin
+        response.headers['Access-Control-Allow-Credentials'] = 'true'
+        response.headers['Access-Control-Allow-Methods'] = 'GET, POST, PUT, DELETE, OPTIONS, PATCH'
+        response.headers['Access-Control-Allow-Headers'] = 'Content-Type, Authorization, X-Requested-With, X-CSRF-Token, Accept, Origin, Accept-Encoding, Accept-Language, Cache-Control, Connection, DNT, Pragma, Referer, User-Agent'
+        response.headers['Access-Control-Expose-Headers'] = 'Content-Length, X-Total-Count, Content-Range'
+    return response
+
+
+# CORS is now handled by the CORSMiddleware above
+
+# Create API router with /api prefix to match frontend expectations
+api_router = APIRouter(prefix="/api")
+
+# Error handlers
+@app.exception_handler(HTTPException)
+async def http_exception_handler(request: Request, exc: HTTPException):
+    """Handle HTTP exceptions and return consistent error responses"""
+    logger.warning(
+        f"HTTP Exception: {exc.status_code} - {exc.detail} - "
+        f"Path: {request.url.path}"
+    )
+    
+    return JSONResponse(
+        status_code=exc.status_code,
+        content={
+            "detail": exc.detail,
+            "status_code": exc.status_code,
+            "path": request.url.path,
+            "timestamp": datetime.utcnow().isoformat()
+        },
+        headers=exc.headers if hasattr(exc, 'headers') else None
+    )
+
+@app.exception_handler(Exception)
+async def global_exception_handler(request: Request, exc: Exception):
+    """Handle all uncaught exceptions"""
+    logger.error(
+        f"Unhandled Exception: {str(exc)} - "
+        f"Path: {request.url.path}"
+    )
+    logger.debug(traceback.format_exc())
+    
+    return JSONResponse(
+        status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+        content={
+            "detail": "Internal server error",
+            "error": str(exc),
+            "path": request.url.path,
+            "timestamp": datetime.utcnow().isoformat()
+        }
+    )
+
+# WebSocket endpoint
+@app.websocket("/api/ws/{user_id}")
+async def websocket_endpoint(websocket: WebSocket, user_id: str):
+    try:
+        await websocket_manager.connect(websocket, user_id)
+        while True:
+            data = await websocket.receive_text()
+            # Handle incoming WebSocket messages
+            try:
+                message = json.loads(data)
+                if message.get("type") == "join_room":
+                    await websocket_manager.join_room(user_id, message.get("room_id"))
+                elif message.get("type") == "leave_room":
+                    await websocket_manager.leave_room(user_id, message.get("room_id"))
+            except Exception as e:
+                logger.error(f"WebSocket message handling error: {e}")
+    except WebSocketDisconnect:
+        websocket_manager.disconnect(websocket)
+
+# Authentication endpoints
+@api_router.post("/auth/register", response_model=dict)
+async def register(
+    request: Request,
+    user_data: UserCreate,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Register a new user
+    
+    Request body:
+    - email: User's email address
+    - password: User's password (min 8 characters)
+    - full_name: User's full name
+    
+    Returns:
+    - access_token: JWT token for authentication
+    - token_type: Bearer token type
+    - user: User information
+    """
+    request_id = str(uuid.uuid4())
+    logger.info(f"[REGISTER-{request_id}] Starting registration for email: {user_data.email}")
+    logger.debug(f"[REGISTER-{request_id}] Request URL: {request.url}")
+    logger.debug(f"[REGISTER-{request_id}] Request headers: {dict(request.headers)}")
+    
+    try:
+        # Log the request body if possible
+        body = await request.body()
+        if body:
+            logger.debug(f"[REGISTER-{request_id}] Request body: {body.decode()}")
+    except Exception as e:
+        logger.warning(f"[REGISTER-{request_id}] Could not log request body: {str(e)}")
+    
+    try:
+        # Initialize AuthService with the database session
+        logger.info(f"[REGISTER-{request_id}] Initializing AuthService")
+        auth_service = AuthService(db)
+        
+        # Prepare user data dictionary
+        logger.debug(f"[REGISTER-{request_id}] Preparing user data")
+        user_data_dict = {
+            "email": user_data.email,
+            "password": user_data.password,
+            "full_name": user_data.full_name,
+            "role": "tester"  # Default role
+        }
+        logger.info(f"[REGISTER] User data prepared: {user_data_dict}")
+        
+        # Validate and create user
+        logger.info("[REGISTER] Calling auth_service.create_user")
+        user = await auth_service.create_user(user_data_dict)
+        logger.info(f"[REGISTER] User created successfully: {user}")
+        
+        # Create access token
+        logger.info("[REGISTER] Creating access token")
+        try:
+            access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+            token_data = {"sub": str(user["id"]), "email": user["email"], "role": user["role"]}
+            logger.info(f"[REGISTER] Token data: {token_data}")
+            
+            access_token = create_access_token(
+                subject=str(user["id"]),
+                expires_delta=access_token_expires
+            )
+            logger.info("[REGISTER] Access token created successfully")
+            
+            response_data = {
+                "access_token": access_token,
+                "token_type": "bearer",
+                "user": user
+            }
+            logger.info(f"[REGISTER] Registration successful for user: {user['email']}")
+            return response_data
+            
+        except Exception as token_error:
+            logger.error(f"[REGISTER] Error creating access token: {str(token_error)}")
+            raise HTTPException(
+                status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+                detail="Error creating access token"
+            )
+        
+    except HTTPException as http_exc:
+        logger.error(f"[REGISTER] HTTP Exception: {str(http_exc.detail) if hasattr(http_exc, 'detail') else str(http_exc)}")
+        logger.debug(f"[REGISTER] HTTP Exception traceback: {traceback.format_exc()}")
+        raise http_exc
+    except Exception as e:
+        error_msg = f"[REGISTER] Unexpected error during registration: {str(e)}"
+        logger.error(error_msg)
+        logger.debug(f"[REGISTER] Error traceback: {traceback.format_exc()}")
+        
+        # Provide more detailed error information in development
+        error_detail = {
+            "detail": "Registration failed due to an unexpected error",
+            "error": str(e),
+            "type": e.__class__.__name__
+        }
+        
+        # Only include traceback in development
+        if os.getenv("ENVIRONMENT", "development").lower() == "development":
+            error_detail["traceback"] = traceback.format_exc()
+            
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_detail
+        )
+
+@api_router.post("/auth/login", response_model=dict)
+async def login(
+    request: Request,
+    user_data: UserLogin,
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Authenticate user and return JWT token
+    
+    Request body:
+    - email: User's email address
+    - password: User's password
+    
+    Returns:
+    - access_token: JWT token for authentication
+    - token_type: Bearer token type
+    - user: User information
+    """
+    try:
+        logger.info(f"Login attempt for email: {user_data.email}")
+        
+        # Query the database for the user
+        query = select(User).where(User.email == user_data.email)
+        result = await db.execute(query)
+        user = result.scalars().first()
+        
+        if not user:
+            logger.warning(f"Authentication failed: User {user_data.email} not found")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect email or password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        # Verify password
+        if not verify_password(user_data.password, str(user.hashed_password)):
+            logger.warning(f"Authentication failed: Incorrect password for user {user_data.email}")
+            raise HTTPException(
+                status_code=status.HTTP_401_UNAUTHORIZED,
+                detail="Incorrect email or password",
+                headers={"WWW-Authenticate": "Bearer"},
+            )
+        
+        # Create access token
+        access_token_expires = timedelta(minutes=ACCESS_TOKEN_EXPIRE_MINUTES)
+        logger.info(f"Creating access token for user ID: {user.id}")
+        access_token = create_access_token(
+            str(user.id), expires_delta=access_token_expires
+        )
+        logger.info("Access token created successfully")
+        
+        # Prepare user data for response (exclude sensitive information)
+        user_data_response = {
+            "id": str(user.id),
+            "email": user.email,
+            "full_name": user.full_name,
+            "role": getattr(user, 'role', 'tester'),
+            "is_active": getattr(user, 'is_active', True),
+            "created_at": user.created_at.isoformat() if user.created_at is not None else None,
+            "updated_at": user.updated_at.isoformat() if user.updated_at is not None else None
+        }
+            
+        logger.info(f"User logged in successfully: {user_data.email}")
+        
+        return {
+            "access_token": access_token,
+            "token_type": "bearer",
+            "user_id": str(user.id),
+            "email": user.email,
+            "full_name": user.full_name,
+            "role": getattr(user, 'role', 'tester'),
+            "user": user_data_response
+        }
+        
+    except HTTPException as he:
+        logger.warning(f"Login failed for {user_data.email}: {str(he.detail)}")
+        raise
+    except Exception as e:
+        logger.error(f"Unexpected error during login for {user_data.email}: {str(e)}", exc_info=True)
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"An unexpected error occurred during login: {str(e)}"
+        )
+
+@api_router.get("/auth/me", response_model=dict)
+async def get_current_user_info(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """
+    Get current authenticated user's information
+    
+    Requires:
+    - Valid JWT token in Authorization header
+    
+    Returns:
+    - User information including id, email, full_name, and role
+    """
+    try:
+        # Get fresh user data from database
+        query = select(User).where(User.id == current_user["id"])
+        result = await db.execute(query)
+        user = result.scalars().first()
+        
+        if not user:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="User not found"
+            )
+            
+        return {
+            "id": str(user.id),
+            "email": user.email,
+            "full_name": user.full_name,
+            "role": getattr(user, 'role', 'tester'),
+            "is_active": getattr(user, 'is_active', True),
+            "created_at": user.created_at.isoformat() if user.created_at is not None else None,
+            "updated_at": user.updated_at.isoformat() if user.updated_at is not None else None
+        }
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error getting user info: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve user information"
+        )
+
+# Project endpoints
+@api_router.post("/projects", response_model=ProjectResponse, status_code=status.HTTP_201_CREATED)
+def create_project(
+    project_data: ProjectCreate, 
+    current_user: dict = Depends(get_current_user_sync),
+    db: Session = Depends(get_db_sync)
+):
+    """
+    Create a new project
+    
+    Required fields:
+    - name: Project name (1-200 characters)
+    - description: Optional project description (max 1000 characters)
+    - team_id: Optional ID of the team this project belongs to
+    - is_active: Whether the project is active (default: true)
+    """
+    try:
+        # Check if team exists if team_id is provided
+        if project_data.team_id:
+            team = db.query(Team).filter(Team.id == project_data.team_id).first()
+            if not team:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Team with ID {project_data.team_id} not found"
+                )
+        
+        # Create project in database
+        db_project = Project(
+            **project_data.dict(exclude_unset=True),
+            created_by=current_user["id"],
+            created_at=datetime.utcnow(),
+            updated_at=datetime.utcnow()
+        )
+        
+        db.add(db_project)
+        db.commit()
+        db.refresh(db_project)
+        
+        # Create activity log
+        create_activity_log(
+            db=db,
+            user_id=current_user["id"],
+            user_name=current_user["full_name"],
+            action="created",
+            target_type="project",
+            target_id=str(db_project.id),
+            target_name=str(db_project.name),
+            description=f"Created project: {db_project.name}"
+        )
+        
+        # Convert to Pydantic model for response
+        return ProjectResponse.model_validate(db_project)
+        
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error creating project: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create project"
+        )
+
+@api_router.get("/projects", response_model=List[ProjectResponse])
+def get_projects(
+    current_user: dict = Depends(get_current_user_sync),
+    db: Session = Depends(get_db_sync),
+    skip: int = 0,
+    limit: int = 100
+):
+    """
+    Get a list of projects accessible by the current user
+    
+    Parameters:
+    - skip: Number of projects to skip (for pagination)
+    - limit: Maximum number of projects to return (max 100)
+    """
+    try:
+        # Get projects where user is the creator or a team member
+        projects = db.query(Project).filter(
+            (Project.created_by == current_user["id"]) |
+            (Project.team_id.in_(
+                db.query(TeamMember.team_id).filter(TeamMember.user_id == current_user["id"])
+            ))
+        ).offset(skip).limit(min(limit, 100)).all()
+        
+        return [ProjectResponse.model_validate(project) for project in projects]
+        
+    except SQLAlchemyError as e:
+        logger.error(f"Error retrieving projects: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve projects"
+        )
+
+@api_router.get("/projects/{project_id}", response_model=ProjectResponse)
+def get_project(
+    project_id: str,
+    current_user: dict = Depends(get_current_user_sync),
+    db: Session = Depends(get_db_sync)
+):
+    """
+    Get a specific project by ID
+    
+    Parameters:
+    - project_id: The ID of the project to retrieve
+    """
+    try:
+        # Get project with access control
+        project = db.query(Project).filter(
+            (Project.id == project_id) &
+            ((Project.created_by == current_user["id"]) |
+             (Project.team_id.in_(
+                 db.query(TeamMember.team_id).filter(TeamMember.user_id == current_user["id"])
+             )))
+        ).first()
+        
+        if not project:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Project not found or access denied"
+            )
+            
+        # Get additional statistics for the project
+        test_case_count = db.query(TestCase).filter(TestCase.project_id == project_id).count()
+        environment_count = db.query(Environment).filter(Environment.project_id == project_id).count()
+        
+        # Get last execution time
+        last_execution = db.query(TestExecution).filter(
+            TestExecution.test_case.has(project_id=project_id)
+        ).order_by(TestExecution.started_at.desc()).first()
+        
+        project_dict = project.__dict__
+        project_dict["test_case_count"] = test_case_count
+        project_dict["environment_count"] = environment_count
+        project_dict["last_execution"] = last_execution.started_at if last_execution else None
+        
+        return ProjectResponse.model_validate(project_dict)
+        
+    except SQLAlchemyError as e:
+        logger.error(f"Error retrieving project: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve project"
+        )
+
+@api_router.put("/projects/{project_id}", response_model=ProjectResponse)
+def update_project(
+    project_id: str,
+    project_data: ProjectUpdate,
+    current_user: dict = Depends(get_current_user_sync),
+    db: Session = Depends(get_db_sync)
+):
+    """
+    Update an existing project
+    
+    Parameters:
+    - project_id: The ID of the project to update
+    - project_data: Fields to update (all fields are optional)
+    """
+    try:
+        # Get project with access control
+        project = db.query(Project).filter(
+            (Project.id == project_id) &
+            (Project.created_by == current_user["id"])  # Only project creator can update
+        ).first()
+        
+        if not project:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Project not found or access denied"
+            )
+            
+        # Check if team exists if team_id is being updated
+        if project_data.team_id is not None and project_data.team_id != project.team_id:
+            team = db.query(Team).filter(Team.id == project_data.team_id).first()
+            if not team:
+                raise HTTPException(
+                    status_code=status.HTTP_404_NOT_FOUND,
+                    detail=f"Team with ID {project_data.team_id} not found"
+                )
+        
+        # Update project fields
+        update_data = project_data.dict(exclude_unset=True)
+        for field, value in update_data.items():
+            setattr(project, field, value)
+        
+        db.commit()
+        db.refresh(project)
+        
+        # Create activity log
+        create_activity_log(
+            db=db,
+            user_id=current_user["id"],
+            user_name=current_user["full_name"],
+            action="updated",
+            target_type="project",
+            target_id=str(project.id),
+            target_name=str(project.name),
+            description=f"Updated project: {project.name}"
+        )
+        
+        return ProjectResponse.model_validate(project)
+        
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error updating project: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to update project"
+        )
+
+@api_router.delete("/projects/{project_id}", status_code=status.HTTP_204_NO_CONTENT)
+def delete_project(
+    project_id: str,
+    current_user: dict = Depends(get_current_user_sync),
+    db: Session = Depends(get_db_sync)
+):
+    """
+    Delete a project
+    
+    Parameters:
+    - project_id: The ID of the project to delete
+    """
+    try:
+        # Get project with access control
+        project = db.query(Project).filter(
+            (Project.id == project_id) &
+            (Project.created_by == current_user["id"])  # Only project creator can delete
+        ).first()
+        
+        if not project:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Project not found or access denied"
+            )
+            
+        # Create activity log before deletion
+        create_activity_log(
+            db=db,
+            user_id=current_user["id"],
+            user_name=current_user["full_name"],
+            action="deleted",
+            target_type="project",
+            target_id=str(project.id),
+            target_name=str(project.name),
+            description=f"Deleted project: {project.name}"
+        )
+        
+        # Delete the project
+        db.delete(project)
+        db.commit()
+        
+        return Response(status_code=status.HTTP_204_NO_CONTENT)
+        
+    except SQLAlchemyError as e:
+        db.rollback()
+        logger.error(f"Error deleting project: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to delete project"
+        )
+
+# Comments endpoints
+@api_router.post("/comments", response_model=CommentResponse)
+async def create_comment(
+    comment_data: CommentCreate, 
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Create a new comment"""
+    try:
+        db_comment = DBComment(
+            **comment_data.dict(),
+            user_id=current_user["id"],
+            user_name=current_user["full_name"]
+        )
+        
+        db.add(db_comment)
+        await db.commit()
+        await db.refresh(db_comment)
+        
+        # Convert to Pydantic model for response
+        comment = CommentResponse.model_validate(db_comment)
+        
+        # Create activity log using async session
+        await create_activity_log_async(
+            db, current_user["id"], current_user["full_name"],
+            "commented", "test_case", str(comment.test_case_id), "",
+            f"Added comment on test case"
+        )
+        
+        # Broadcast comment update (if websocket_manager is available)
+        if 'websocket_manager' in globals():
+            await websocket_manager.broadcast_comment_update(comment.dict())
+        
+        return comment
+        
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error creating comment: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to create comment"
+        )
+
+@api_router.get("/comments/{test_case_id}", response_model=List[CommentResponse])
+async def get_comments(
+    test_case_id: str, 
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get comments for a test case"""
+    try:
+        from sqlalchemy.future import select
+        
+        query = select(DBComment).where(
+            DBComment.test_case_id == test_case_id
+        ).order_by(DBComment.created_at.asc())
+        
+        result = await db.execute(query)
+        comments = result.scalars().all()
+        
+        return [CommentResponse.model_validate(comment) for comment in comments]
+        
+    except Exception as e:
+        logger.error(f"Error retrieving comments: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve comments"
+        )
+
+@api_router.put("/comments/{comment_id}/resolve", response_model=CommentResponse)
+async def resolve_comment(
+    comment_id: str, 
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Resolve a comment"""
+    try:
+        from sqlalchemy.future import select
+        
+        # Get the comment
+        query = select(DBComment).where(
+            DBComment.id == comment_id,
+            DBComment.user_id == current_user["id"]
+        )
+        result = await db.execute(query)
+        db_comment = result.scalars().first()
+        
+        if not db_comment:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Comment not found or you don't have permission to resolve it"
+            )
+        
+        # Update the comment
+        setattr(db_comment, 'resolved', True)
+        setattr(db_comment, 'updated_at', datetime.utcnow())
+        await db.commit()
+        await db.refresh(db_comment)
+        
+        # Convert to Pydantic model for response
+        comment = CommentResponse.model_validate(db_comment)
+        
+        # Broadcast comment update (if websocket_manager is available)
+        if 'websocket_manager' in globals():
+            await websocket_manager.broadcast_comment_update(comment.dict())
+        
+        return comment
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error resolving comment: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to resolve comment"
+        )
+
+# Export endpoints
+@api_router.get("/test-cases/export/csv")
+async def export_test_cases_csv(
+    project_id: str = Query(..., description="Project ID to export test cases for"),
+    db: AsyncSession = Depends(get_db)
+):
+    """Export test cases to CSV format"""
+    try:
+        from fastapi.responses import StreamingResponse
+        from app.services.export_service import TestCaseExportService
+        from sqlalchemy.future import select
+        from app.models.db_models import Project as DBProject
+        
+        # Get project details
+        result = await db.execute(select(DBProject).where(DBProject.id == project_id))
+        project = result.scalars().first()
+        
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        
+        # Get test cases for the project
+        result = await db.execute(
+            select(TestCase).where(TestCase.project_id == project_id)
+        )
+        test_cases = result.scalars().all()
+        
+        # Convert to dict format
+        test_cases_data = []
+        for tc in test_cases:
+            # Get test steps
+            steps_result = await db.execute(
+                select(TestStep).where(TestStep.test_case_id == tc.id).order_by(TestStep.step_number)
+            )
+            steps = steps_result.scalars().all()
+            
+            tc_data = {
+                "id": tc.id,
+                "title": tc.title,
+                "description": tc.description,
+                "test_type": tc.test_type,
+                "priority": tc.priority,
+                "status": tc.status,
+                "expected_result": tc.expected_result,
+                "tags": tc.tags or [],
+                "preconditions": tc.preconditions,
+                "created_by": tc.created_by,
+                "created_at": tc.created_at,
+                "test_steps": [{"description": step.description, "expected_result": step.expected_result} for step in steps]
+            }
+            test_cases_data.append(tc_data)
+        
+        # Generate CSV
+        csv_output = TestCaseExportService.export_to_csv(test_cases_data, str(project.name))
+        
+        # Create filename
+        filename = TestCaseExportService.get_export_filename(str(project.name), "csv")
+        
+        # Return as streaming response
+        response = StreamingResponse(
+            iter([csv_output.getvalue()]),
+            media_type="text/csv",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+        
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error exporting test cases to CSV: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to export test cases: {str(e)}"
+        )
+
+@api_router.get("/test-cases/export/excel")
+async def export_test_cases_excel(
+    project_id: str = Query(..., description="Project ID to export test cases for"),
+    db: AsyncSession = Depends(get_db)
+):
+    """Export test cases to Excel format"""
+    try:
+        from fastapi.responses import StreamingResponse
+        from app.services.export_service import TestCaseExportService
+        from sqlalchemy.future import select
+        from app.models.db_models import Project as DBProject
+        
+        # Get project details
+        result = await db.execute(select(DBProject).where(DBProject.id == project_id))
+        project = result.scalars().first()
+        
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        
+        # Get test cases for the project
+        result = await db.execute(
+            select(TestCase).where(TestCase.project_id == project_id)
+        )
+        test_cases = result.scalars().all()
+        
+        # Convert to dict format
+        test_cases_data = []
+        for tc in test_cases:
+            # Get test steps
+            steps_result = await db.execute(
+                select(TestStep).where(TestStep.test_case_id == tc.id).order_by(TestStep.step_number)
+            )
+            steps = steps_result.scalars().all()
+            
+            tc_data = {
+                "id": tc.id,
+                "title": tc.title,
+                "description": tc.description,
+                "test_type": tc.test_type,
+                "priority": tc.priority,
+                "status": tc.status,
+                "expected_result": tc.expected_result,
+                "tags": tc.tags or [],
+                "preconditions": tc.preconditions,
+                "created_by": tc.created_by,
+                "created_at": tc.created_at,
+                "test_steps": [{"description": step.description, "expected_result": step.expected_result} for step in steps]
+            }
+            test_cases_data.append(tc_data)
+        
+        # Generate Excel
+        excel_output = TestCaseExportService.export_to_excel(test_cases_data, str(project.name))
+        
+        # Create filename
+        filename = TestCaseExportService.get_export_filename(str(project.name), "xlsx")
+        
+        # Return as streaming response
+        response = StreamingResponse(
+            iter([excel_output.getvalue()]),
+            media_type="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+        
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error exporting test cases to Excel: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to export test cases: {str(e)}"
+        )
+
+@api_router.get("/test-cases/export/pdf")
+async def export_test_cases_pdf(
+    project_id: str = Query(..., description="Project ID to export test cases for"),
+    db: AsyncSession = Depends(get_db)
+):
+    """Export test cases to PDF format"""
+    try:
+        from fastapi.responses import StreamingResponse
+        from app.services.export_service import TestCaseExportService
+        from sqlalchemy.future import select
+        from app.models.db_models import Project as DBProject
+        
+        # Get project details
+        result = await db.execute(select(DBProject).where(DBProject.id == project_id))
+        project = result.scalars().first()
+        
+        if not project:
+            raise HTTPException(status_code=404, detail="Project not found")
+        
+        # Get test cases for the project
+        result = await db.execute(
+            select(TestCase).where(TestCase.project_id == project_id)
+        )
+        test_cases = result.scalars().all()
+        
+        # Convert to dict format
+        test_cases_data = []
+        for tc in test_cases:
+            # Get test steps
+            steps_result = await db.execute(
+                select(TestStep).where(TestStep.test_case_id == tc.id).order_by(TestStep.step_number)
+            )
+            steps = steps_result.scalars().all()
+            
+            tc_data = {
+                "id": tc.id,
+                "title": tc.title,
+                "description": tc.description,
+                "test_type": tc.test_type,
+                "priority": tc.priority,
+                "status": tc.status,
+                "expected_result": tc.expected_result,
+                "tags": tc.tags or [],
+                "prerequisites": tc.prerequisites,
+                "created_by": tc.created_by,
+                "created_at": tc.created_at,
+                "test_steps": [{"description": step.description, "expected_result": step.expected_result} for step in steps]
+            }
+            test_cases_data.append(tc_data)
+        
+        # Generate PDF
+        pdf_output = TestCaseExportService.export_to_pdf(test_cases_data, str(project.name))
+        
+        # Create filename
+        filename = TestCaseExportService.get_export_filename(str(project.name), "pdf")
+        
+        # Return as streaming response
+        response = StreamingResponse(
+            iter([pdf_output.getvalue()]),
+            media_type="application/pdf",
+            headers={"Content-Disposition": f"attachment; filename={filename}"}
+        )
+        
+        return response
+        
+    except Exception as e:
+        logger.error(f"Error exporting test cases to PDF: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to export test cases: {str(e)}"
+        )
+
+# AI endpoints
+@api_router.post("/ai/generate-tests", response_model=List[TestCaseResponse])
+async def ai_generate_tests(
+    request: AITestGenerationRequest,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Generate test cases using AI"""
+    try:
+        # Convert TestGenerationType to TestType for AI service compatibility
+        test_type_mapping = {
+            "functional": TestType.FUNCTIONAL,
+            "integration": TestType.INTEGRATION,
+            "unit": TestType.UNIT,
+            "performance": TestType.PERFORMANCE,
+            "api": TestType.API,
+            "ui": TestType.VISUAL  # Map UI to VISUAL as closest equivalent
+        }
+        
+        # Convert Priority from ai.py to db_models.py for compatibility
+        priority_mapping = {
+            "low": Priority.LOW,
+            "medium": Priority.MEDIUM,
+            "high": Priority.HIGH,
+            "critical": Priority.CRITICAL
+        }
+        
+        mapped_test_type = test_type_mapping.get(request.test_type.value, TestType.FUNCTIONAL)
+        mapped_priority = priority_mapping.get(request.priority.value, Priority.MEDIUM)
+        
+        # Call AI service to generate test cases
+        test_cases = await ai_service.generate_test_cases(
+            prompt=request.prompt,
+            test_type=mapped_test_type,
+            priority=mapped_priority,
+            count=request.count
+        )
+        
+        # Convert to Pydantic models for response
+        return [
+            TestCaseResponse.model_validate(tc) 
+            for tc in test_cases
+        ]
+        
+    except Exception as e:
+        logger.error(f"Error generating test cases: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to generate test cases: {str(e)}"
+        )
+
+@api_router.post("/ai/generate-tests-from-url", response_model=List[TestCaseResponse])
+async def ai_generate_tests_from_url(
+    request: AIURLTestGenerationRequest,
+    # current_user: dict = Depends(get_current_user),  # Temporarily disabled for testing
+    db: AsyncSession = Depends(get_db)
+):
+    """Generate test cases from website URL using MCP server"""
+    try:
+        logger.info(f"Generating test cases from URL: {request.url} for project: {request.project_id}")
+        
+        # Validate URL format first
+        if not request.url.startswith(('http://', 'https://')):
+            raise ValueError(f"Invalid URL format: {request.url}. URL must start with http:// or https://")
+        
+        # Convert TestGenerationType to TestType for AI service compatibility
+        test_type_mapping = {
+            "functional": TestType.FUNCTIONAL,
+            "integration": TestType.INTEGRATION,
+            "unit": TestType.UNIT,
+            "performance": TestType.PERFORMANCE,
+            "api": TestType.API,
+            "ui": TestType.VISUAL  # Map UI to VISUAL as closest equivalent
+        }
+        
+        # Convert Priority from ai.py to db_models.py for compatibility
+        priority_mapping = {
+            "low": Priority.LOW,
+            "medium": Priority.MEDIUM,
+            "high": Priority.HIGH,
+            "critical": Priority.CRITICAL
+        }
+        
+        mapped_test_type = test_type_mapping.get(request.test_type.value, TestType.FUNCTIONAL)
+        mapped_priority = priority_mapping.get(request.priority.value, Priority.MEDIUM)
+        
+        # Call AI service to generate test cases from URL
+        test_cases_data = await ai_service.generate_test_cases_from_url(
+            url=request.url,
+            project_id=request.project_id,
+            test_type=mapped_test_type,
+            priority=mapped_priority,
+            count=request.count
+        )
+        
+        # Save test cases to database
+        saved_test_cases = []
+        try:
+            from sqlalchemy.future import select
+            from app.models.db_models import Project as DBProject
+            
+            # Check if project exists, if not create it
+            result = await db.execute(select(DBProject).where(DBProject.id == request.project_id))
+            db_project = result.scalars().first()
+            
+            if not db_project:
+                # Create project if it doesn't exist
+                # Using AI Generator user for AI-generated projects
+                from app.db.session import ensure_ai_generator_user_exists
+                ai_generator_user_id = await ensure_ai_generator_user_exists()
+                db_project = DBProject(
+                    id=request.project_id,
+                    name=f"Project {request.project_id}",
+                    description="Auto-created project for AI test generation",
+                    created_by=ai_generator_user_id,
+                    created_at=datetime.utcnow(),
+                    updated_at=datetime.utcnow()
+                )
+                db.add(db_project)
+                await db.flush()
+                logger.info(f"Created new project: {request.project_id}")
+            
+            # Save each test case to database
+            from app.db.session import ensure_ai_generator_user_exists
+            ai_generator_user_id = await ensure_ai_generator_user_exists()  # Using AI Generator user for AI-generated content
+            for tc_data in test_cases_data:
+                # Create test case in database
+                db_test_case = TestCase(
+                    id=str(uuid.uuid4()),
+                    project_id=request.project_id,
+                    title=tc_data["title"],
+                    description=tc_data["description"],
+                    test_type=tc_data.get("test_type", mapped_test_type.value),
+                    priority=tc_data.get("priority", mapped_priority.value),
+                    status="draft",
+                    created_by=ai_generator_user_id,
+                    created_at=datetime.utcnow(),
+                    updated_at=datetime.utcnow(),
+                    ai_generated=True,
+                    self_healing_enabled=True,
+                    tags=tc_data.get("tags", []),
+                    preconditions=tc_data.get("preconditions", ""),
+                    prerequisites=tc_data.get("prerequisites", ""),
+                    expected_result=tc_data.get("expected_result", "")
+                )
+                
+                db.add(db_test_case)
+                await db.flush()  # Get the ID
+            
+                # Create test steps if they exist
+                if "steps" in tc_data and tc_data["steps"]:
+                    for i, step_data in enumerate(tc_data["steps"], 1):
+                        test_step = TestStep(
+                            id=str(uuid.uuid4()),
+                            test_case_id=db_test_case.id,
+                            step_number=i,
+                            description=step_data.get("description", step_data.get("action", "")),
+                            expected_result=step_data.get("expected_result", step_data.get("expected", "")),
+                            created_at=datetime.utcnow(),
+                            updated_at=datetime.utcnow()
+                        )
+                        db.add(test_step)
+                
+                # Convert to response format using model_validate
+                response = TestCaseResponse.model_validate({
+                    "id": str(db_test_case.id),
+                    "project_id": str(db_test_case.project_id),
+                    "title": str(db_test_case.title),
+                    "description": str(db_test_case.description or ""),
+                    "test_type": str(db_test_case.test_type),
+                    "priority": str(db_test_case.priority),
+                    "status": str(db_test_case.status),
+                    "created_by": str(db_test_case.created_by),
+                    "created_at": db_test_case.created_at,
+                    "updated_at": db_test_case.updated_at,
+                    "test_steps": []
+                })
+                saved_test_cases.append(response)
+            
+            # Commit all changes
+            await db.commit()
+            
+            logger.info(f"Successfully generated and saved {len(saved_test_cases)} test cases from URL")
+            return saved_test_cases
+        
+        except Exception as e:
+            logger.error(f"Error saving test cases to database: {str(e)}")
+            logger.error(traceback.format_exc())
+            if hasattr(db, 'is_active') and db.is_active:
+                await db.rollback()
+            raise e
+    
+    except ValueError as e:
+        # More specific error handling for validation errors
+        logger.error(f"Validation error generating test cases from URL: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=str(e)
+        )
+    except Exception as e:
+        logger.error(f"Error generating test cases from URL: {str(e)}")
+        logger.error(traceback.format_exc())
+        error_message = str(e)
+        # Improve error messages for common issues
+        if "Connection refused" in error_message:
+            error_message = "Could not connect to the website. Please check the URL and try again."
+        elif "Timeout" in error_message:
+            error_message = "Connection timed out while accessing the website. The site might be slow or unavailable."
+        elif "Not Found" in error_message or "404" in error_message:
+            error_message = "The requested page was not found. Please check the URL and try again."
+        elif "403" in error_message or "Forbidden" in error_message:
+            error_message = "Access to this website is forbidden. The site may be blocking automated access."
+        elif "500" in error_message or "Server Error" in error_message:
+            error_message = "The website encountered an internal server error. Please try again later."
+        
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=error_message
+        )
+
+@api_router.post("/ai/debug-test", response_model=AIAnalysisResult)
+async def ai_debug_test(
+    request: AIDebugRequest,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Debug test failure using AI"""
+    try:
+        from sqlalchemy.future import select
+        
+        # Get the test execution
+        query = select(TestExecution).where(TestExecution.id == request.execution_id)
+        result = await db.execute(query)
+        execution = result.scalars().first()
+        
+        if not execution:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Test execution not found"
+            )
+        
+        # Get the test case
+        query = select(TestCase).where(TestCase.id == execution.test_case_id)
+        result = await db.execute(query)
+        test_case = result.scalars().first()
+        
+        if not test_case:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Test case not found"
+            )
+        
+        # Call AI service to debug the test failure
+        result = await ai_service.debug_test_failure(
+            test_case=test_case,
+            error_message=request.error_description,
+            logs=request.logs
+        )
+        
+        # Update execution with analysis result
+        setattr(execution, 'ai_analysis', result.model_dump())
+        await db.commit()
+        
+        return result
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error debugging test: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to debug test: {str(e)}"
+        )
+
+@api_router.post("/ai/prioritize-tests", response_model=List[str])
+async def ai_prioritize_tests(
+    request: AIPrioritizationRequest,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Prioritize test cases using AI"""
+    try:
+        from sqlalchemy.future import select
+        
+        # Get test cases from database
+        query = select(TestCase).where(TestCase.id.in_(request.test_case_ids))
+        result = await db.execute(query)
+        test_cases = list(result.scalars().all())
+        
+        if not test_cases:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="No test cases found with the provided IDs"
+            )
+        
+        # Call AI service to prioritize test cases
+        prioritized_ids = await ai_service.prioritize_test_cases(
+            test_cases=test_cases,
+            context=request.context
+        )
+        
+        return prioritized_ids
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Error prioritizing tests: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to prioritize tests: {str(e)}"
+        )
+
+# Import TestExecution model from db_models
+from app.models.db_models import TestExecution as DBTestExecution
+
+# Test Execution endpoints
+@api_router.post("/executions", response_model=TestExecutionResponse)
+async def create_test_execution(
+    execution_data: TestExecutionCreate,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Create a new test execution"""
+    try:
+        # Create new test execution
+        db_execution = DBTestExecution(
+            **execution_data.dict(),
+            executed_by=current_user["id"]
+        )
+        
+        db.add(db_execution)
+        await db.commit()
+        await db.refresh(db_execution)
+        
+        # Convert to Pydantic model for response
+        execution = TestExecutionResponse.model_validate(db_execution)
+        
+        # Broadcast execution update if websocket manager is available
+        if 'websocket_manager' in globals():
+            await websocket_manager.broadcast_test_execution_update(execution.dict())
+        
+        return execution
+        
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error creating test execution: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to create test execution: {str(e)}"
+        )
+
+@api_router.get("/executions", response_model=List[TestExecutionResponse])
+async def get_test_executions(
+    test_case_id: Optional[str] = None,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get test executions"""
+    try:
+        from sqlalchemy.future import select
+        
+        query = select(DBTestExecution)
+        
+        if test_case_id:
+            query = query.where(DBTestExecution.test_case_id == test_case_id)
+        
+        # Get most recent 100 executions
+        query = query.order_by(DBTestExecution.created_at.desc()).limit(100)
+        result = await db.execute(query)
+        executions = result.scalars().all()
+        
+        # Convert to Pydantic models for response
+        return [
+            TestExecutionResponse.model_validate(execution) 
+            for execution in executions
+        ]
+        
+    except Exception as e:
+        logger.error(f"Error fetching test executions: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to fetch test executions: {str(e)}"
+        )
+
+@api_router.put("/executions/{execution_id}/status", response_model=TestExecutionResponse)
+async def update_execution_status(
+    execution_id: str,
+    execution_status: ExecutionStatus,
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Update execution status"""
+    try:
+        from sqlalchemy.future import select
+        
+        # Find the execution
+        query = select(DBTestExecution).where(DBTestExecution.id == execution_id)
+        result = await db.execute(query)
+        execution = result.scalars().first()
+        
+        if not execution:
+            raise HTTPException(
+                status_code=status.HTTP_404_NOT_FOUND,
+                detail="Test execution not found"
+            )
+        
+        # Update status and timestamps
+        setattr(execution, 'status', execution_status)
+        setattr(execution, 'updated_at', datetime.utcnow())
+        
+        if execution_status == ExecutionStatus.RUNNING:
+            setattr(execution, 'started_at', datetime.utcnow())
+        elif execution_status in [ExecutionStatus.COMPLETED, ExecutionStatus.FAILED]:
+            setattr(execution, 'completed_at', datetime.utcnow())
+        
+        await db.commit()
+        await db.refresh(execution)
+        
+        # Convert to Pydantic model for response
+        execution_response = TestExecutionResponse.model_validate(execution)
+        
+        # Broadcast execution update if websocket manager is available
+        if 'websocket_manager' in globals():
+            await websocket_manager.broadcast_test_execution_update(
+                execution_response.dict()
+            )
+        
+        return execution_response
+        
+    except HTTPException:
+        raise
+    except Exception as e:
+        await db.rollback()
+        logger.error(f"Error updating execution status: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"Failed to update execution status: {str(e)}"
+        )
+
+# Import models for dashboard
+from app.models.db_models import Project, TestCase as DBTestCase, TestExecution, ActivityLog
+from sqlalchemy import or_, and_, func
+
+# Dashboard endpoints
+@api_router.get("/dashboard/stats", response_model=DashboardStats)
+async def get_dashboard_stats(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db)
+):
+    """Get dashboard statistics"""
+    try:
+        from sqlalchemy.future import select
+        from sqlalchemy.orm import selectinload
+        
+        # Get user's projects
+        query = select(Project).where(
+            or_(
+                Project.created_by == current_user["id"],
+                # Note: Team members relationship needs to be properly implemented
+                # Project.team_members.any(current_user["id"])
+            )
+        )
+        result = await db.execute(query)
+        projects = result.scalars().all()
+        
+        project_ids = [str(project.id) for project in projects]
+        
+        if not project_ids:
+            return DashboardStats()
+        
+        # Get statistics
+        test_case_query = select(func.count(DBTestCase.id)).where(
+            DBTestCase.project_id.in_(project_ids)
+        )
+        result = await db.execute(test_case_query)
+        total_test_cases = result.scalar()
+        
+        # Get executions for pass rate calculation
+        exec_query = select(TestExecution).join(DBTestCase).where(
+            DBTestCase.project_id.in_(project_ids)
+        )
+        result = await db.execute(exec_query)
+        executions = result.scalars().all()
+        
+        total_executions = len(executions)
+        passed_executions = len([e for e in executions if str(e.status) == "completed"])
+        pass_rate = (passed_executions / total_executions * 100) if total_executions > 0 else 0
+        
+        # Calculate average execution time
+        completed_executions = [e for e in executions if getattr(e, 'duration', None) is not None]
+        total_duration = 0.0
+        for e in completed_executions:
+            try:
+                duration_val = getattr(e, 'duration', 0)
+                if duration_val is not None:
+                    total_duration += float(duration_val)
+            except (TypeError, ValueError):
+                continue
+        avg_execution_time = total_duration / len(completed_executions) if completed_executions else 0.0
+        
+        # Get active test runs
+        active_runs_query = select(func.count(TestExecution.id)).where(
+            TestExecution.status == "running"
+        )
+        result = await db.execute(active_runs_query)
+        active_runs = result.scalar()
+        
+        # Get recent activity
+        activity_query = select(ActivityLog).order_by(
+            ActivityLog.created_at.desc()
+        ).limit(10)
+        result = await db.execute(activity_query)
+        recent_activity = result.scalars().all()
+        
+        # Convert SQLAlchemy models to Pydantic models
+        activity_feeds = [
+            ActivityFeed.model_validate({
+                "id": str(activity.id),
+                "user_id": str(activity.user_id),
+                "user_name": str(activity.user_name),
+                "action": str(activity.action),
+                "target_type": str(activity.target_type),
+                "target_id": str(activity.target_id),
+                "target_name": str(activity.target_name or ""),
+                "description": str(activity.description or ""),
+                "created_at": activity.created_at
+            })
+            for activity in recent_activity
+        ]
+        
+        return DashboardStats(
+            total_test_cases=total_test_cases or 0,
+            total_executions=total_executions,
+            pass_rate=pass_rate,
+            average_execution_time=avg_execution_time,
+            active_test_runs=active_runs or 0,
+            recent_activity=activity_feeds
+        )
+        
+    except Exception as e:
+        logger.error(f"Error getting dashboard stats: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve dashboard statistics"
+        )
+
+@api_router.get("/dashboard/activity", response_model=List[ActivityFeed])
+async def get_activity_feed(
+    current_user: dict = Depends(get_current_user),
+    db: AsyncSession = Depends(get_db),
+    limit: int = 50
+):
+    """Get activity feed"""
+    try:
+        from sqlalchemy.future import select
+        
+        query = select(ActivityLog).order_by(
+            ActivityLog.created_at.desc()
+        ).limit(limit)
+        result = await db.execute(query)
+        activities = result.scalars().all()
+        
+        return [
+            ActivityFeed.model_validate({
+                "id": str(activity.id),
+                "user_id": str(activity.user_id),
+                "user_name": str(activity.user_name),
+                "action": str(activity.action),
+                "target_type": str(activity.target_type),
+                "target_id": str(activity.target_id),
+                "target_name": str(activity.target_name or ""),
+                "description": str(activity.description or ""),
+                "created_at": activity.created_at
+            })
+            for activity in activities
+        ]
+    except Exception as e:
+        logger.error(f"Error getting activity feed: {str(e)}")
+        raise HTTPException(
+            status_code=status.HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="Failed to retrieve activity feed"
+        )
+
+# Utility functions
+def create_activity_log(db, user_id: str, user_name: str, action: str, target_type: str, target_id: str, target_name: str, description: str):
+    """Create activity log entry"""
+    try:
+        activity = ActivityLog(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+            user_name=user_name,
+            action=action,
+            target_type=target_type,
+            target_id=target_id,
+            target_name=target_name,
+            description=description,
+            created_at=datetime.utcnow()
+        )
+        
+        db.add(activity)
+        db.commit()
+        
+        # Note: WebSocket broadcast removed to avoid async issues in sync function
+        # Can be re-added in async context if needed
+        
+    except Exception as e:
+        logger.error(f"Error creating activity log: {str(e)}")
+        db.rollback()
+
+async def create_activity_log_async(db: AsyncSession, user_id: str, user_name: str, action: str, target_type: str, target_id: str, target_name: str, description: str):
+    """Create activity log entry (async version)"""
+    try:
+        activity = ActivityLog(
+            id=str(uuid.uuid4()),
+            user_id=user_id,
+            user_name=user_name,
+            action=action,
+            target_type=target_type,
+            target_id=target_id,
+            target_name=target_name,
+            description=description,
+            created_at=datetime.utcnow()
+        )
+        
+        db.add(activity)
+        await db.commit()
+        
+        # Note: WebSocket broadcast can be added here if needed
+        
+    except Exception as e:
+        logger.error(f"Error creating activity log: {str(e)}")
+        await db.rollback()
+
+# Health check endpoint
+@api_router.get("/health")
+async def health_check():  # pyright: ignore[reportRedeclaration]
+    """Health check endpoint"""
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+# Temporary projects endpoint without authentication for debugging
+@api_router.get("/projects-debug")
+async def get_projects_debug(db: AsyncSession = Depends(get_db)):
+    """Temporary endpoint to debug projects loading without authentication"""
+    try:
+        from app.models.db_models import Project
+        from sqlalchemy.future import select
+        
+        result = await db.execute(select(Project).where(Project.is_active == True))
+        projects = result.scalars().all()
+        
+        project_list = []
+        for project in projects:
+            project_list.append({
+                "id": project.id,
+                "name": project.name,
+                "description": project.description,
+                "created_by": project.created_by,
+                "is_active": project.is_active,
+                "created_at": project.created_at.isoformat() if project.created_at is not None else None,
+                "updated_at": project.updated_at.isoformat() if project.updated_at is not None else None
+            })
+        
+        return {
+            "status": "success",
+            "count": len(project_list),
+            "projects": project_list
+        }
+        
+    except Exception as e:
+        logger.error(f"Error in debug endpoint: {str(e)}")
+        import traceback
+        traceback.print_exc()
+        return {
+            "status": "error",
+            "error": str(e),
+            "count": 0,
+            "projects": []
+        }
+
+# Temporary projects endpoint without authentication - returns project list directly
+@api_router.get("/projects-test")
+async def get_projects_test(db: AsyncSession = Depends(get_db)):
+    """Temporary endpoint for testing projects dropdown - no auth required"""
+    try:
+        from app.models.db_models import Project
+        from sqlalchemy.future import select
+        
+        result = await db.execute(select(Project).where(Project.is_active == True))
+        projects = result.scalars().all()
+        
+        project_list = []
+        for project in projects:
+            project_list.append({
+                "id": project.id,
+                "name": project.name,
+                "description": project.description,
+                "created_by": project.created_by,
+                "is_active": project.is_active,
+                "created_at": project.created_at.isoformat() if project.created_at is not None else None,
+                "updated_at": project.updated_at.isoformat() if project.updated_at is not None else None
+            })
+        
+        return project_list  # Return list directly to match expected format
+        
+    except Exception as e:
+        logger.error(f"Error in test projects endpoint: {str(e)}")
+        return []
+
+# Health check endpoint
+@api_router.get("/health")
+async def health_check():
+    """Health check endpoint"""
+    return {"status": "ok", "timestamp": datetime.utcnow().isoformat()}
+
+# Include API routers with the correct prefix
+# Note: We're using a simplified approach to avoid import errors
+try:
+    logger.info("Initializing API routers...")
+    
+    # Include routers with /api prefix (no /v1 in the path)
+    # The individual route files will handle their own sub-paths
+    
+    # Include the main API router that has the /api prefix already set
+    app.include_router(api_router)
+    
+    # Include the v1 auth router with proper prefix
+    app.include_router(auth.router, prefix="/api/v1/auth", tags=["Authentication"])
+    
+    # Include other routers as they become available
+    app.include_router(projects.router, prefix="/api/v1/projects", tags=["Projects"])
+    app.include_router(test_cases.router, prefix="/api/v1/test-cases", tags=["Test Cases"])
+    app.include_router(newman.router, prefix="/api/v1/newman", tags=["Newman"])
+    app.include_router(test_plans.router, prefix="/api/v1/test-plans", tags=["Test Plans"])  # Added test_plans router
+    
+    # Add dedicated test endpoints with v1 prefix for frontend compatibility
+    @app.get("/api/v1/projects-test", tags=["Testing"])
+    async def get_projects_test_v1(db: AsyncSession = Depends(get_db)):
+        """Projects test endpoint with v1 prefix for frontend compatibility"""
+        try:
+            from app.models.db_models import Project
+            from sqlalchemy.future import select
+            
+            result = await db.execute(select(Project).where(Project.is_active == True))
+            projects = result.scalars().all()
+            
+            project_list = []
+            for project in projects:
+                project_list.append({
+                    "id": project.id,
+                    "name": project.name,
+                    "description": project.description,
+                    "created_by": project.created_by,
+                    "is_active": project.is_active,
+                    "created_at": project.created_at.isoformat() if project.created_at is not None else None,
+                    "updated_at": project.updated_at.isoformat() if project.updated_at is not None else None
+                })
+            
+            return project_list  # Return list directly to match expected format
+            
+        except Exception as e:
+            logger.error(f"Error in test projects endpoint: {str(e)}")
+            return []
+    
+    
+    logger.info("API routers initialized successfully")
+except Exception as e:
+    logger.error(f"Error initializing API routers: {str(e)}")
+    logger.debug(traceback.format_exc())
+    # Don't raise - let the app continue with the routes that did load
+
+# Root endpoint for backward compatibility
+@app.get("/", tags=["Health"])
+async def root() -> dict:
+    """
+    Root endpoint for health checks and basic API information.
+    
+    Returns:
+        dict: API status and version information
+    """
+    return {
+        "message": "Welcome to IntelliTest API",
+        "status": "operational",
+        "version": "1.0.0",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+@app.get("/health", tags=["Health"])
+async def app_health_check() -> dict:
+    """
+    Health check endpoint to verify the API is running and can connect to the database.
+    
+    Returns:
+        dict: Health status and database connection status
+    """
+    db_ok = False
+    db = None
+    try:
+        # Test database connection
+        db = SessionLocal()
+        db.execute(text("SELECT 1"))
+        db_ok = True
+    except Exception as e:
+        logger.error(f"Database connection error: {str(e)}")
+        logger.debug(traceback.format_exc())
+    finally:
+        if db:
+            db.close()
+    
+    return {
+        "status": "healthy" if db_ok else "unhealthy",
+        "database": "connected" if db_ok else "disconnected",
+        "timestamp": datetime.utcnow().isoformat()
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    
+    # Configure logging
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+    
+    # Run the application
+    uvicorn.run(
+        "server:app",
+        host=os.getenv("HOST", "0.0.0.0"),
+        port=int(os.getenv("PORT", 8001)),
+        reload=os.getenv("RELOAD", "true").lower() == "true",
+        log_level=os.getenv("LOG_LEVEL", "info"),
+    )

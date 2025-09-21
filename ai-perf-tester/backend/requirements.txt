@@ -1,0 +1,13 @@
+fastapi
+uvicorn
+sqlalchemy
+pydantic
+psycopg2-binary
+python-multipart
+langgraph>=0.0.19
+langchain
+langchain-core
+langchain-openai
+openai
+aiofiles
+python-dotenv
