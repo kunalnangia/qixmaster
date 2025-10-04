@@ -68,28 +68,57 @@ cd /d "c:\Users\kunal\Downloads\qix-master\qix-master"
 start "JMeter" /min cmd /c ".\start-jmeter.bat"
 
 echo.
-echo Installing AI Requirements and Starting LangGraph/AI Perf Tester Backend...
-echo Note: This script ensures virtual environment activation and installs AI requirements
-cd /d "c:\Users\kunal\Downloads\qix-master\qix-master\ai-perf-tester\backend"
-echo Installing AI requirements...
-pip install -r ai_requirements.txt
-
+echo ==========================================
+echo Starting AI Perf Tester Backend...
+echo ==========================================
 echo.
-echo Starting LangGraph/AI Perf Tester Backend with OpenAI LLM Model...
-echo Note: This script ensures virtual environment activation
-REM Check if virtual environment exists and activate it
-if exist ".venv" (
-    echo Activating virtual environment for AI Perf Tester...
-    start "AI Perf Tester" cmd /c ".venv\Scripts\activate.bat && python start.py"
+
+set "AI_BACKEND_DIR=c:\Users\kunal\Downloads\qix-master\qix-master\ai-perf-tester\backend"
+
+echo Checking AI Perf Tester directory...
+if not exist "%AI_BACKEND_DIR%" (
+    echo ❌ Error: AI Perf Tester directory not found at: %AI_BACKEND_DIR%
+    pause
+    exit /b 1
+)
+
+cd /d "%AI_BACKEND_DIR%"
+
+echo Installing AI requirements...
+if exist "ai_requirements.txt" (
+    pip install -r ai_requirements.txt
 ) else (
-    echo Creating and activating virtual environment for AI Perf Tester...
-    start "AI Perf Tester" cmd /c "python -m venv .venv && .venv\Scripts\activate.bat && pip install -r ai_requirements.txt && python start.py"
+    echo ❌ Error: ai_requirements.txt not found in %AI_BACKEND_DIR%
+    pause
+    exit /b 1
 )
 
 echo.
-echo Starting Backend...
-cd /d "c:\Users\kunal\Downloads\qix-master\qix-master\backend"
-start "Backend" cmd /c "python -m uvicorn app.main:app --host 0.0.0.0 --port 8001 --reload --log-level debug"
+echo Starting AI Perf Tester Backend with OpenAI LLM Model...
+
+if exist ".venv" (
+    echo Activating existing virtual environment...
+    start "AI Perf Tester" cmd /c "cd /d "%AI_BACKEND_DIR%" && .venv\Scripts\activate.bat && python start.py"
+) else (
+    echo Creating new virtual environment...
+    python -m venv .venv
+    if %ERRORLEVEL% NEQ 0 (
+        echo ❌ Failed to create virtual environment
+        pause
+        exit /b 1
+    )
+    echo Installing requirements in new virtual environment...
+    start "AI Perf Tester" cmd /c "cd /d "%AI_BACKEND_DIR%" && .venv\Scripts\activate.bat && pip install -r ai_requirements.txt && python start.py"
+)
+
+echo AI Perf Tester is starting in a new window...
+
+echo.
+echo ==========================================
+echo Starting Backend with Database Initialization...
+echo ==========================================
+cd /d "c:\Users\kunal\Downloads\qix-master\qix-master"
+start "Backend" cmd /c ".\start-backend.bat"
 
 echo.
 echo Starting Frontend...

@@ -1,9 +1,20 @@
 import os
+from pathlib import Path
+from dotenv import load_dotenv
 from sqlalchemy import create_engine, text
 from sqlalchemy.exc import SQLAlchemyError
 
-# Database URL - using the one from your .env file
-DATABASE_URL = "postgresql://postgres:Ayeshaayesha@12@db.lflecyuvttemfoyixngi.supabase.co:5432/postgres"
+# Load environment variables
+env_path = Path(__file__).parent / 'backend' / '.env'
+if not env_path.exists():
+    env_path = Path(__file__).parent / '.env'  # Fallback to root .env
+
+load_dotenv(env_path, override=True)
+
+# Get database URL from environment variables
+DATABASE_URL = os.getenv("DATABASE_URL")
+if not DATABASE_URL:
+    raise ValueError("DATABASE_URL not found in environment variables")
 
 try:
     # Create engine and test connection

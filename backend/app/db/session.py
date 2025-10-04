@@ -1,272 +1,175 @@
 import os
 import sys
 import logging
-import traceback
+import certifi
+import asyncio
 from typing import AsyncGenerator
-from contextlib import contextmanager
-
+from contextlib import asynccontextmanager
+from urllib.parse import urlparse, parse_qsl, urlunparse
 from sqlalchemy import create_engine, text
 from sqlalchemy.orm import sessionmaker, scoped_session
 from sqlalchemy.ext.asyncio import create_async_engine, AsyncSession, async_sessionmaker
 from sqlalchemy.pool import NullPool
 from dotenv import load_dotenv
 
-# Import Base from base.py to avoid circular imports
-from .base import Base
+# Set SSL certificate path for all SSL connections
+os.environ['SSL_CERT_FILE'] = certifi.where()
+os.environ['REQUESTS_CA_BUNDLE'] = certifi.where()
 
 # Configure logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# Load environment variables from .env file
-env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), '.env')
-logger.info(f"Loading environment from: {env_path}")
+# Global variables for the engines - they will be initialized later
+async_engine = None
+sync_engine = None
 
-# Load environment variables
-load_dotenv(env_path, override=True)
+def load_environment_variables():
+    """Load environment variables from the .env file."""
+    env_path = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))), '.env')
+    load_dotenv(env_path, override=True)
 
-# Get database URL from environment variable
-DATABASE_URL = os.getenv("DATABASE_URL")
-DATABASE_URL_ASYNC = os.getenv("DATABASE_URL_ASYNC")
+    global DATABASE_URL, DATABASE_URL_ASYNC
+    DATABASE_URL = os.getenv("DATABASE_URL")
+    DATABASE_URL_ASYNC = os.getenv("DATABASE_URL_ASYNC")
 
-if not DATABASE_URL:
-    raise ValueError("No DATABASE_URL found in environment variables")
+    if not DATABASE_URL or not DATABASE_URL_ASYNC:
+        raise ValueError("DATABASE_URL or DATABASE_URL_ASYNC not found in environment variables")
+    
+    logger.info("Environment variables loaded")
+    logger.info(f"DATABASE_URL: {DATABASE_URL}")
+    logger.info(f"DATABASE_URL_ASYNC: {DATABASE_URL_ASYNC}")
 
-# Use async URL if available, otherwise construct it from sync URL
-if not DATABASE_URL_ASYNC:
-    # Construct async URL from sync URL
-    DATABASE_URL_ASYNC = str(DATABASE_URL).replace("postgresql://", "postgresql+asyncpg://")
+# Load environment variables on module import
+load_environment_variables()
+ 
+# In app/db/session.py
 
-# Ensure comprehensive PgBouncer compatibility by removing any existing cache parameters
-# and adding correct ones
-if DATABASE_URL_ASYNC and "?" in DATABASE_URL_ASYNC:
-    base_url, params = DATABASE_URL_ASYNC.split("?", 1)
-    # Remove existing cache parameters
-    params_list = [p for p in params.split("&") if not (p.startswith("statement_cache_size") or p.startswith("prepared_statement_cache_size"))]
-    # Add correct cache parameters as integers (not strings)
-    params_list.extend(["statement_cache_size=0", "prepared_statement_cache_size=0"])
-    DATABASE_URL_ASYNC = base_url + "?" + "&".join(params_list)
-elif DATABASE_URL_ASYNC:
-    DATABASE_URL_ASYNC += "?statement_cache_size=0&prepared_statement_cache_size=0"
+# Replace the async engine creation with:
+from sqlalchemy.ext.asyncio import create_async_engine
+from sqlalchemy.pool import NullPool
+import os
+from urllib.parse import urlparse, parse_qs
 
-# Fix port for PgBouncer compatibility if needed
-if ":5432/" in DATABASE_URL_ASYNC:
-    DATABASE_URL_ASYNC = DATABASE_URL_ASYNC.replace(":5432/", ":6543/")
 
-logger.info("Database URLs configured")
-logger.info(f"Sync URL: {DATABASE_URL[:60]}...")
-logger.info(f"Async URL: {DATABASE_URL_ASYNC[:60]}...")
+ 
+ 
+async def initialize_database():
+    global async_engine, sync_engine
+    
+    # Load environment variables
+    DATABASE_URL = os.getenv("DATABASE_URL")
+    DATABASE_URL_ASYNC = os.getenv("DATABASE_URL_ASYNC")
+    
+    logger.info("Environment variables loaded")
+    logger.info(f"DATABASE_URL: {DATABASE_URL}")
+    logger.info(f"DATABASE_URL_ASYNC: {DATABASE_URL_ASYNC}")
 
-# Create sync engine for migrations and sync operations
-if DATABASE_URL.startswith("sqlite"):
-    # SQLite configuration
-    engine = create_engine(
-        DATABASE_URL, 
-        connect_args={"check_same_thread": False},
-        echo=True
-    )
-else:
-    # PostgreSQL configuration
-    sync_database_url = str(DATABASE_URL).replace("postgresql://", "postgresql+psycopg2://")
-    if ":5432/" in sync_database_url:
-        sync_database_url = sync_database_url.replace(":5432/", ":6543/")
+    try:
+        # Sync engine (using psycopg2)
+        sync_engine = create_engine(
+            DATABASE_URL,
+            echo=True,
+            pool_pre_ping=True
+        )
         
-    engine = create_engine(
-        sync_database_url,
+        # Parse the async URL to handle SSL
+        parsed_url = urlparse(DATABASE_URL_ASYNC)
+        query_params = parse_qs(parsed_url.query)
+        
+        # Prepare connection arguments
+        connect_args = {
+            "statement_cache_size": 0,
+            "prepared_statement_cache_size": 0
+        }
+        
+        # Handle SSL
+        if 'sslmode' in query_params and query_params['sslmode'][0] == 'require':
+            connect_args['ssl'] = 'require'
+        
+        # Rebuild URL without sslmode in query
+        clean_url = DATABASE_URL_ASYNC.replace('postgresql+asyncpg://', 'postgresql://')
+        
+        # Create async engine
+        async_engine = create_async_engine(
+            clean_url,
+            echo=True,
+            poolclass=NullPool,
+            connect_args=connect_args
+        )
+        
+        logger.info("Database engines initialized successfully")
+        return async_engine
+        
+    except Exception as e:
+        logger.error(f"Error initializing database: {str(e)}")
+        raise
+    
+    global async_engine, sync_engine
+    
+    # Load environment variables
+    load_environment_variables()
+    
+    # Sync engine (using psycopg2)
+    sync_engine = create_engine(
+        os.getenv("DATABASE_URL"),
         echo=True,
-        pool_pre_ping=True,
-        pool_size=5,
-        max_overflow=10,
-        pool_recycle=300,
-        pool_timeout=30,
+        pool_pre_ping=True
+    )
+    
+    # Async engine (using asyncpg)
+    async_engine = create_async_engine(
+        os.getenv("DATABASE_URL_ASYNC").replace('postgresql+asyncpg://', 'postgresql://'),
+        echo=True,
+        poolclass=NullPool,
         connect_args={
-            'keepalives': 1,
-            'keepalives_idle': 30,
-            'keepalives_interval': 10,
-            'keepalives_count': 5
+            "ssl": "require",
+            "statement_cache_size": 0,
+            "prepared_statement_cache_size": 0
         }
     )
+    
+    logger.info("Database engines initialized successfully")
+    return async_engine
 
-# Create async engine for FastAPI with asyncpg
-async_engine = create_async_engine(
-    DATABASE_URL_ASYNC,
-    echo=False,
-    poolclass=NullPool,
-    connect_args={
-        "statement_cache_size": 0,  # Must be integer, not string
-        "prepared_statement_cache_size": 0,  # Must be integer, not string
-        "server_settings": {
-            "statement_cache_size": "0",  # String for server settings
-            "prepared_statement_cache_size": "0"  # String for server settings
-        }
-    },
-    execution_options={
-        "compiled_cache": None,
-    }
-)
-
-# Session factories
-SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
-AsyncSessionLocal = async_sessionmaker(
-    bind=async_engine,
-    class_=AsyncSession,
-    expire_on_commit=False
-)
-
-# Scoped session for thread safety
-ScopedSession = scoped_session(SessionLocal)
-
-# Dependency for getting async database session
+# NOTE: Dependency for FastAPI. Yields a new session for each request.
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
-    async with AsyncSessionLocal() as session:
-        try:
-            yield session
-            await session.commit()
-        except Exception as e:
-            await session.rollback()
-            logger.error(f"Database session error: {e}")
-            raise
-        finally:
-            pass
+    """Provides a database session for a single request."""
+    # Ensure the engine is initialized before use
+    if async_engine is None:
+        raise RuntimeError("Database engine not initialized. Please run initialize_database() first.")
+        
+    async_session_local = async_sessionmaker(
+        async_engine,
+        class_=AsyncSession,
+        expire_on_commit=False,
+    )
+    async with async_session_local() as session:
+        yield session
 
-# Sync session for migrations and scripts
-@contextmanager
-def get_sync_db():
-    db = ScopedSession()
-    try:
-        yield db
-        db.commit()
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Database error: {e}")
-        raise
-    finally:
-        db.close()
-
-# Synchronous database dependency
+# NOTE: Dependency for synchronous database operations
 def get_db_sync():
-    db = SessionLocal()
+    """Provides a synchronous database session for a single request."""
+    if sync_engine is None:
+        raise RuntimeError("Synchronous database engine not initialized.")
+    SessionLocal = scoped_session(sessionmaker(autocommit=False, autoflush=False, bind=sync_engine))
     try:
+        db = SessionLocal()
         yield db
-    except Exception as e:
-        db.rollback()
-        logger.error(f"Database session error: {e}")
-        raise
     finally:
         db.close()
-
-async def reset_database_connections() -> bool:
-    """
-    Reset database connections to ensure PgBouncer compatibility.
-    This is an alias for force_connection_reset for backward compatibility.
-    """
-    return await force_connection_reset()
-
-def init_db():
-    """Initialize the database and create all tables."""
-    try:
-        Base.metadata.create_all(bind=engine)
-        logger.info("Database tables created successfully")
-        return True
-    except Exception as e:
-        logger.error(f"Error creating database tables: {e}")
-        raise
-
-# Simple test user management
-TEST_USER_ID = "temp-user-id-for-testing"
-TEST_USER_EMAIL = "test@example.com"
-TEST_USER_NAME = "Test User"
-
-AI_GENERATOR_USER_ID = "ai-generator"
-AI_GENERATOR_EMAIL = "ai-tests@example.com"
-AI_GENERATOR_NAME = "AI Test Generator"
-
-async def ensure_test_user_exists() -> str:
-    """Ensure the test user exists in the database, creating it if necessary"""
-    from app.models.db_models import User
-    from app.core.security import get_password_hash
-    
-    async with AsyncSessionLocal() as session:
-        try:
-            # Check if test user exists
-            from sqlalchemy.future import select
-            result = await session.execute(
-                select(User).where(User.id == TEST_USER_ID)
-            )
-            existing_user = result.scalars().first()
-            
-            if not existing_user:
-                # Create test user
-                from datetime import datetime
-                test_user = User(
-                    id=TEST_USER_ID,
-                    email=TEST_USER_EMAIL,
-                    full_name=TEST_USER_NAME,
-                    hashed_password=get_password_hash("test1234"),
-                    role="tester",
-                    is_active=True,
-                    created_at=datetime.utcnow(),
-                    updated_at=datetime.utcnow()
-                )
-                session.add(test_user)
-                await session.commit()
-            
-            return TEST_USER_ID
-        except Exception as e:
-            await session.rollback()
-            raise e
-
-async def ensure_ai_generator_user_exists() -> str:
-    """Ensure the AI generator user exists in the database, creating it if necessary"""
-    from app.models.db_models import User
-    from app.core.security import get_password_hash
-    
-    async with AsyncSessionLocal() as session:
-        try:
-            # Check if AI generator user exists
-            from sqlalchemy.future import select
-            result = await session.execute(
-                select(User).where(User.id == AI_GENERATOR_USER_ID)
-            )
-            existing_user = result.scalars().first()
-            
-            if not existing_user:
-                # Create AI generator user
-                from datetime import datetime
-                ai_user = User(
-                    id=AI_GENERATOR_USER_ID,
-                    email=AI_GENERATOR_EMAIL,
-                    full_name=AI_GENERATOR_NAME,
-                    hashed_password=get_password_hash("ai-system-user"),
-                    role="system",
-                    is_active=True,
-                    created_at=datetime.utcnow(),
-                    updated_at=datetime.utcnow()
-                )
-                session.add(ai_user)
-                await session.commit()
-            
-            return AI_GENERATOR_USER_ID
-        except Exception as e:
-            await session.rollback()
-            raise e
-
-def get_ai_generator_user_id() -> str:
-    return AI_GENERATOR_USER_ID
-
-def get_test_user_id() -> str:
-    return TEST_USER_ID
 
 async def force_connection_reset() -> bool:
     """
     Force reset database connections to ensure PgBouncer compatibility.
     Disposes of the async engine to reset connections.
     """
-    try:
-        await async_engine.dispose()
-        logger.info("Database connections reset successfully for PgBouncer compatibility")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to reset database connections: {e}")
-        return False
-
+    if async_engine:
+        try:
+            await async_engine.dispose()
+            logger.info("Database connections reset successfully for PgBouncer compatibility")
+            return True
+        except Exception as e:
+            logger.error(f"Failed to reset database connections: {e}")
+            return False
+    return False

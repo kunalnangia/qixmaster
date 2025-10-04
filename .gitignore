@@ -1,6 +1,13 @@
-# See https://help.github.com/articles/ignoring-files/ for more about ignoring files.
+# Ignore everything in the parent directory
+/*
 
-# IDE and editors
+# But don't ignore the qix-master directory
+!/qix-master/
+
+# Keep the .gitignore file
+!.gitignore
+
+# Standard ignore rules for the qix-master directory
 .idea/
 .vscode/
 *.sublime-workspace
@@ -11,15 +18,9 @@
 .DS_Store
 Thumbs.db
 
-# Temporary Office files
-~$*
-*.tmp
-*.temp
-
 # Dependencies
 node_modules/
-/node_modules
-/.pnp
+.pnp
 .pnp.js
 .yarn/install-state.gz
 .yarn/*
@@ -40,10 +41,8 @@ next-env.d.ts
 # Production builds
 /build
 dist/
-dist
 
-# Environment and sensitive files
-# Local .env files
+# Environment files
 .env
 .env.*
 !.env.example
